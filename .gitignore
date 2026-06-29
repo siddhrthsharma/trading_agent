@@ -22,10 +22,16 @@ __pycache__/
 data/raw/
 data/cache/
 
+logs/
+
 .cursor/
 .vscode/
 .idea/
 
 .DS_Store
 
+# Personal investor profile — use profile.example.json as the committed template
+profile.json
+
 *.md
+!LEARNING_JOURNAL.md

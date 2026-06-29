@@ -1,0 +1,11 @@
+{
+  "horizon_years": 30,
+  "risk_tolerance": "moderate",
+  "monthly_contribution": 500,
+  "lump_sum": 10000,
+  "monthly_expenses": 2500,
+  "emergency_fund": 8000,
+  "accounts": ["Roth IRA", "401k", "taxable"],
+  "constraints": [],
+  "current_holdings": {}
+}
