@@ -27,7 +27,18 @@ FULL_UNIVERSE: list[str] = [
 ]
 
 # Price history / comparison only — never proposed as a holding.
-BENCHMARKS: list[str] = ["SPY", "VOO", "IVV", "AGG"]
+# EFA (developed-markets ETF, inception 2001) stands in for VXUS pre-2011 in backtests.
+BENCHMARKS: list[str] = ["SPY", "VOO", "IVV", "AGG", "EFA"]
+
+# Static expense ratios (annual %, as decimals) — yfinance does not reliably report these.
+# Source: fund provider fact sheets (CURSOR_PROJECT_SPEC.md §Asset Universe).
+EXPENSE_RATIOS: dict[str, float] = {
+    "VTI": 0.0003, "QQQ": 0.0020,
+    "VEA": 0.0005, "VXUS": 0.0007, "VWO": 0.0008,
+    "BND": 0.0003, "TLT": 0.0015, "BIL": 0.001356, "SHY": 0.0015, "SCHP": 0.0003,
+    "VNQ": 0.0012, "GLD": 0.0040,
+    "SPY": 0.0009, "VOO": 0.0003, "IVV": 0.0003, "AGG": 0.0003, "EFA": 0.0032,
+}
 
 # Same index exposure, different wrapper (mutual fund share class).
 MUTUAL_FUND_EQUIVALENTS: dict[str, str] = {
@@ -84,11 +95,13 @@ def get_settings() -> Settings:
         fred_api_key=fred_api_key,
         tickers=tickers,
         data_dir=_PROJECT_ROOT / "data" / "raw",
-        price_history_days=180,
+        price_history_days=9125,  # ~25 years — long enough to cover the 2008 GFC regime
         fred_series={
             "FEDFUNDS": "Federal Funds Rate",
             "CPIAUCSL": "Consumer Price Index",
             "UNRATE": "Unemployment Rate",
+            "DGS10": "10-Year Treasury Yield",
+            "DGS2": "2-Year Treasury Yield",
         },
         rss_feeds=[
             "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",

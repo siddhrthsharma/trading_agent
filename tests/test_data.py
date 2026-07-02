@@ -56,6 +56,16 @@ def _make_macro_df(series_id: str = "FEDFUNDS", n: int = 3) -> pd.DataFrame:
     })
 
 
+def _make_fundamentals_record(ticker: str = "VTI", as_of: str = "2026-01-01", pe: float = 26.0) -> dict:
+    return {
+        "ticker": ticker,
+        "as_of": pd.Timestamp(as_of, tz="UTC"),
+        "pe": pe,
+        "dividend_yield": 0.01,
+        "fetched_at": pd.Timestamp(as_of, tz="UTC"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # test_imports
 # ---------------------------------------------------------------------------
@@ -352,6 +362,138 @@ def test_filings_index_schema(tmp_path):
     assert r["accession_no"] == "0000320193-26-000001"
     assert r["filed_at"].tzinfo is not None  # UTC-aware
     assert Path(r["path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# test_fundamentals_store_roundtrip
+# ---------------------------------------------------------------------------
+
+def test_fundamentals_store_roundtrip(tmp_path, monkeypatch):
+    """save_fundamentals → load_fundamentals must return identical data."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    record = _make_fundamentals_record()
+    store.save_fundamentals([record])
+    loaded = store.load_fundamentals("VTI")
+
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["pe"] == 26.0
+
+
+def test_fundamentals_accumulate_across_days(tmp_path, monkeypatch):
+    """Fundamentals snapshots from different days must both be kept (history accumulates)."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-01-01", pe=26.0)])
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-02-01", pe=27.0)])
+    loaded = store.load_fundamentals("VTI")
+
+    assert len(loaded) == 2
+    assert sorted(loaded["pe"].tolist()) == [26.0, 27.0]
+
+
+def test_fundamentals_same_day_upserts(tmp_path, monkeypatch):
+    """Saving twice for the same (ticker, as_of) must upsert, not duplicate."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-01-01", pe=26.0)])
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-01-01", pe=99.0)])
+    loaded = store.load_fundamentals("VTI")
+
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["pe"] == 99.0
+
+
+def test_fundamentals_no_lookahead(tmp_path, monkeypatch):
+    """load_fundamentals(until=mid) must exclude snapshots after the cutoff."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-01-01", pe=26.0)])
+    store.save_fundamentals([_make_fundamentals_record(as_of="2026-06-01", pe=30.0)])
+
+    loaded = store.load_fundamentals("VTI", until=datetime(2026, 3, 1, tzinfo=UTC))
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["pe"] == 26.0
+
+
+def test_fetch_fundamentals_tolerates_missing_fields(tmp_path, monkeypatch):
+    """fetch_fundamentals must pass through None PE/yield rather than crashing (bond ETFs have no PE)."""
+    _patch_data_dir(monkeypatch, tmp_path)
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.info = {"yield": 0.04}  # no trailingPE, no dividendYield — bond-ETF-like
+
+    with patch("data.fetch_fundamentals.yf.Ticker", FakeTicker):
+        from data.fetch_fundamentals import fetch_fundamentals
+        results = fetch_fundamentals(["BND"])
+
+    assert results["BND"] == 1
+    from data import store
+    loaded = store.load_fundamentals("BND")
+    assert pd.isna(loaded.iloc[0]["pe"])
+    assert loaded.iloc[0]["dividend_yield"] == 0.04
+
+
+# ---------------------------------------------------------------------------
+# test_snapshots
+# ---------------------------------------------------------------------------
+
+def test_macro_snapshot_builds_from_store(tmp_path, monkeypatch):
+    """data.snapshots.macro_snapshot must load each FRED series and build a MacroSnapshot."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    for series_id, values in {
+        "FEDFUNDS": [5.0, 5.0],
+        "DGS10": [4.0, 4.5],
+        "DGS2": [4.0, 4.0],
+        "CPIAUCSL": [300.0, 309.0],
+        "UNRATE": [4.0, 4.2],
+    }.items():
+        dates = pd.to_datetime(["2025-01-01", "2026-01-01"], utc=True)
+        df = pd.DataFrame({
+            "series_id": [series_id] * 2,
+            "date": dates,
+            "value": values,
+            "fetched_at": [pd.Timestamp("2026-01-01", tz="UTC")] * 2,
+        })
+        store.save_macro(df, series_id)
+
+    from data.snapshots import macro_snapshot
+    snap = macro_snapshot(as_of=datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert snap.fed_funds == 5.0
+    assert snap.yield_curve_spread == pytest.approx(0.5)
+
+
+def test_macro_snapshot_missing_series_raises(tmp_path, monkeypatch):
+    """macro_snapshot must raise clearly if a required FRED series has no data."""
+    _patch_data_dir(monkeypatch, tmp_path)
+
+    from data.snapshots import macro_snapshot
+    with pytest.raises(ValueError):
+        macro_snapshot(as_of=datetime(2026, 1, 1, tzinfo=UTC))
+
+
+def test_valuation_snapshot_handles_missing_and_present_data(tmp_path, monkeypatch):
+    """valuation_snapshot must report None for tickers with no fundamentals and real values otherwise."""
+    _patch_data_dir(monkeypatch, tmp_path)
+    from data import store
+
+    store.save_fundamentals([_make_fundamentals_record(ticker="VTI", as_of="2026-01-01", pe=26.0)])
+
+    from data.snapshots import valuation_snapshot
+    snap = valuation_snapshot(as_of=datetime(2026, 1, 1, tzinfo=UTC), tickers=["VTI", "BND"])
+
+    assert snap.funds["VTI"]["pe"] == 26.0
+    assert snap.funds["VTI"]["expense_ratio"] is not None
+    assert snap.funds["BND"]["pe"] is None
+    assert snap.funds["BND"]["expense_ratio"] is not None
 
 
 # ---------------------------------------------------------------------------

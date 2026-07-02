@@ -25,7 +25,7 @@ I split it this way because LLMs are good at language but bad at math. They make
 3.  Compute default allocation       -> core/portfolios.py    (usable on its own, no AI needed)
 4.  DCA schedule + growth projection -> core/contributions.py
 
-    ==== Phases 4+ (not built yet) ====
+    ==== Phases 4-6 (now built) ====
 5.  Fetch and cache macro data       -> data/fetch_macro.py (FRED API)
 6.  Fetch ETF prices + fundamentals  -> data/fetch_prices.py (yfinance)
 7.  Compute engine signals           -> engine/ (returns, Sharpe, optimizer)
@@ -147,15 +147,14 @@ Every data point gets two timestamps: `date` (when it happened) and `fetched_at`
 
 I download OHLCV (Open, High, Low, Close, Volume) data for each ETF using `yfinance`. I adjust automatically for stock splits and dividends so historical comparisons are accurate. Data is saved in Parquet format, which is a columnar compressed format that is much faster to read than CSV for time-series data.
 
-## Phases 4 to 8: Not Yet Built
+## Phases 7 and 8: Not Yet Built
+
+Phases 4, 5, and 6 are done (see the entries at the bottom of this journal). What's left:
 
 | Phase | What | Key concepts I will encounter |
 |---|---|---|
-| **4** | Macro regime agent | Yield curve interpretation, real rates, LLM confidence scoring |
-| **5** | Portfolio engine + backtester | Mean-variance optimization, Sharpe ratio, max drawdown, no-lookahead rule |
-| **6** | Multi-agent allocation | Allocator and critic pattern, agent orchestration in `main.py` |
-| **7** | Streamlit dashboard | Data visualization, glide path charts, scenario tables |
-| **8** | Stretch: tax-aware location, Monte Carlo | Asset location theory, probability distributions for goal planning |
+| **7** | Critic ↔ allocator revision loop | Agents looping on each other's output, escalation |
+| **8** | Streamlit dashboard | Data visualization, glide path charts, scenario tables |
 
 ## Key Python Patterns I Am Using
 
@@ -230,3 +229,54 @@ Network calls fail sometimes. This decorator automatically retries with longer w
 **How it connects:**
 * When I get to Phases 4 through 6 (building out `agents/`, the critic, and the allocator), I will know whether plain Python wiring is enough or if LangGraph earns its place for more complex multi-step flows.
 * `utils/llm.py` stays the single entry point for all LLM calls either way. The course shapes how I think about orchestration, not how individual agents talk to the model.
+
+---
+
+## [Phase 4] — Static agent pipeline: macro, valuation, allocator, critic — 2026-07-01
+
+**Files changed:** `engine/signals.py`, `engine/allocation.py`, `data/fetch_fundamentals.py`, `data/store.py`, `data/snapshots.py`, `agents/macro_agent.py`, `agents/valuation_agent.py`, `agents/allocator_agent.py`, `agents/critic_agent.py`, `main.py`, tests
+
+**What I built:** The first full agent pipeline. Four LLM agents run in a fixed order: macro reads the economic regime, valuation says what's cheap or rich, allocator proposes a plan, and critic stress-tests it. `engine/signals.py` turns raw FRED data into a clean `MacroSnapshot` (yield-curve spread, CPI year-over-year, real fed funds rate, unemployment). `engine/allocation.py` holds the important part: `apply_tilts()` and the deterministic rule checks. `data/snapshots.py` loads from storage and hands the engine clean DataFrames so the engine never touches disk. I also added a `fundamentals` table (P/E and dividend yield per ETF, append-only) so a later tool has history to compare against.
+
+**Why this way:** The allocator never asks the LLM for a percentage — it asks for *tilts*, and Python turns tilts into weights. Every tilt is clamped to ±10 points, so even a hallucinated +90% tilt becomes +10% before renormalizing. This is how I let the LLM nudge an allocation without letting it invent one. The critic also runs its rule checks in Python first, then the LLM only critiques the reasoning — it never decides on its own whether something like QQQ concentration is a problem.
+
+**Technical patterns:** Each agent has a private `_validate()` that range-checks the LLM output (like `0 <= confidence <= 1`), wrapped together with the LLM call inside a retry. That way a response that parses fine but has a bad value (like `recession_signal = 1.5`) gets retried instead of crashing.
+
+**Financial concepts:** A diversified index fund can legitimately be 50-70% of a portfolio, so I raised the single-position warning from 50% to 75% (a failing test caught that the honest all-equity default, VTI 70% / VXUS 30%, was flagging itself). Concentration risk is about *narrow* bets (single stocks, one sector), not a total-market ETF doing its job.
+
+**How it connects:** `main.py` chains snapshots → macro → valuation → allocator → critic, and skips gracefully if the API key or local data is missing. I spot-checked the macro agent at 2007-12-31, 2020-03-31, and 2022-09-30 and it gave sensible, different regime reads for each date.
+
+---
+
+## [Phase 5] — Deterministic engine + multi-regime backtester — 2026-07-01
+
+**Files changed:** `engine/returns.py`, `engine/metrics.py`, `engine/costs.py`, `engine/optimizer.py`, `backtest/regimes.py`, `backtest/baselines.py`, `backtest/engine.py`, `main.py`, `requirements.txt`, tests
+
+**What I built:** The quant core and a backtester. `engine/returns.py` computes daily returns, annualized return, volatility, and covariance. `engine/metrics.py` turns an equity curve into CAGR, Sharpe, Sortino, max drawdown, worst year, and days-to-recovery. `engine/costs.py` converts an annual expense ratio into a daily drag. `engine/optimizer.py` wraps PyPortfolioOpt for mean-variance plus a simple inverse-volatility option. `backtest/engine.py` simulates one allocation over one date window using share-based tracking (so weights actually *drift* between rebalances), with annual rebalancing, monthly contributions, and cost drag baked into each fund's price. `backtest/regimes.py` names four stress windows (2008, 2020, 2022, the 2010s bull) plus a held-out period.
+
+**Why this way:** I bake costs into each ticker's price series *before* the simulation runs, not as an adjustment at the end. That matches how expense ratios really work (they continuously shave the fund's value), so rebalancing and contributions stack on top correctly without double-counting. For no-lookahead protection I used two independent layers: the loader already asserts internally, and the backtester adds its own `assert index.max() <= end` against the external end date. That second layer isn't busywork — my first attempt at it was accidentally always-true, so I rewrote it and wrote a test that feeds in fake future data to prove it actually catches leaks now.
+
+**Technical patterns:** `compute_metrics()` gets CAGR from actual calendar days elapsed (`.days / 365.25`), not an assumed row frequency, so the same function handles both a monthly test fixture and a daily backtest. I also hand-computed expected results for the rebalance test instead of just checking "did it run" — matching my own arithmetic is what confirmed the share-tracking was really correct.
+
+**Financial concepts:**
+* **Max drawdown and recovery time** are the "can I actually hold this" numbers. A 46% drop that takes 2+ years to recover feels totally different from the same CAGR delivered smoothly.
+* **Estimation error in mean-variance:** the max-Sharpe weights are very sensitive to tiny changes in the return estimate, which is why the optimizer output is only ever *context* for the allocator, never a target.
+* **Survivorship/inception bias:** `VXUS` didn't exist until 2011, so a literal 2008 backtest would break. I added a `BACKTEST_PROXIES` map (VXUS → EFA) used only inside `backtest/`, and every substitution is logged, never silent — that keeps the 2008 stress test honest instead of quietly skipping it.
+
+**How it connects:** `main.py` now also computes an unconstrained mean-variance read and passes it to the allocator as an optional hint — it changes the prompt context, never the tilt-clamping from Phase 4. Running `python -m backtest.engine` on real data matched known history: 2008 drawdowns of -47% to -57%, COVID's ~120-day V-shaped recovery, and 2022's negative return with no recovery in the window.
+
+---
+
+## [Phase 6] — Tool use: agents pull their own data — 2026-07-01
+
+**Files changed:** `utils/llm.py`, `agents/tools/macro_tools.py`, `agents/tools/valuation_tools.py`, `agents/tools/portfolio_tools.py`, `agents/macro_agent.py`, `agents/valuation_agent.py`, `main.py`, tests
+
+**What I built:** Agents can now fetch their own data instead of being handed a snapshot. `utils/llm.py` gained `ToolSpec` and `call_llm_with_tools()`, a loop that gives the model a toolset, runs whatever it calls, feeds the results back, and repeats until it answers with valid JSON. Three tool modules under `agents/tools/` cover macro (FRED series, yield curve, real rate), valuation (fundamentals, historical P/E), and portfolio (drift, rule checks, growth projection). The macro and valuation agents kept their Phase-4 logic renamed to `run_static()` and gained a new tool-driven `run()`.
+
+**Why this way:** Every tool is a thin adapter — it does the I/O and calls into `engine/`/`core/` for any actual math, so the "no math in agents" rule still holds even though agents now decide what to fetch. `fetch_fred_series` sits behind a `FRED_ALLOWLIST` because it could technically request *any* series ID; the allowlist is the real limit on how far an agent can reach. `main.py` tries the tool-driven `run()` first and falls back to the snapshot-based `run_static()` if anything fails, so the Phase-4 pipeline becomes the safety net.
+
+**Technical patterns:** A tool that throws doesn't crash the agent — `call_llm_with_tools` catches it and feeds an `{"error": ...}` message back so the model can react. I also learned the hard way that `ToolSpec` captures the function reference at import time, so patching the module-level function in a test does nothing; you have to patch the tools list itself with a replacement `ToolSpec`.
+
+**Financial concepts:** None new this phase — it's purely an architecture shift (agents pulling data instead of receiving it) built on Phase 4's reasoning and Phase 5's engine.
+
+**How it connects:** An offline test stubs the Groq client with a two-round script (round 1 calls `fetch_fred_series`, round 2 answers) and confirms the tool actually ran. A live `python main.py` run confirmed the same thing end-to-end, with sensibly lower confidence than the static path since the agent gathered less data.

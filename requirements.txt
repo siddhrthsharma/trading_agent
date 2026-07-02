@@ -46,3 +46,5 @@ pyarrow
 tenacity
 pytest
 groq
+scipy==1.18.0
+PyPortfolioOpt==1.6.0

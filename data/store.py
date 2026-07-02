@@ -23,6 +23,7 @@ _PRICE_COLS = ["date", "open", "high", "low", "close", "volume", "ticker", "fetc
 _NEWS_COLS = ["published_at", "fetched_at", "ticker", "headline", "summary", "source", "url"]
 _MACRO_COLS = ["series_id", "date", "value", "fetched_at"]
 _FILING_COLS = ["ticker", "form", "accession_no", "filed_at", "fetched_at", "path"]
+_FUNDAMENTALS_COLS = ["ticker", "as_of", "pe", "dividend_yield", "fetched_at"]
 
 
 def _data_dir() -> Path:
@@ -195,6 +196,58 @@ def load_macro(series_id: str, *, until: datetime | None = None) -> pd.DataFrame
         # For now we filter on observation date — may introduce slight lookahead for macro.
         df = df[df["date"] <= cutoff].copy()
         assert df["date"].max() <= cutoff if not df.empty else True, "Lookahead detected in load_macro"
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals
+# ---------------------------------------------------------------------------
+
+def save_fundamentals(records: list[dict]) -> Path:
+    """Append+dedup fundamentals snapshots to data/raw/fundamentals.parquet.
+
+    Dedup key = (ticker, as_of) so re-running on the same day upserts, but
+    each new day accumulates a fresh row — this is what compare_historical_pe
+    (Phase 6) reads to build a local valuation history over time.
+    """
+    path = _data_dir() / "fundamentals.parquet"
+    incoming = pd.DataFrame(records, columns=_FUNDAMENTALS_COLS) if records else pd.DataFrame(columns=_FUNDAMENTALS_COLS)
+    if not incoming.empty:
+        incoming["as_of"] = _to_utc(incoming["as_of"])
+        incoming["fetched_at"] = _to_utc(incoming["fetched_at"])
+
+    existing = _read_parquet(path, _FUNDAMENTALS_COLS)
+    if not existing.empty:
+        existing["as_of"] = _to_utc(existing["as_of"])
+        existing["fetched_at"] = _to_utc(existing["fetched_at"])
+        combined = pd.concat([existing, incoming], ignore_index=True)
+    else:
+        combined = incoming
+
+    combined = (
+        combined
+        .drop_duplicates(subset=["ticker", "as_of"], keep="last")
+        .sort_values(["ticker", "as_of"])
+        .reset_index(drop=True)
+    )
+    _write_parquet(combined, path)
+    logger.debug("Saved %d fundamentals rows to %s", len(combined), path)
+    return path
+
+
+def load_fundamentals(ticker: str, *, until: datetime | None = None) -> pd.DataFrame:
+    """Load fundamentals snapshots for a ticker; if `until` set, only as_of <= until."""
+    path = _data_dir() / "fundamentals.parquet"
+    df = _read_parquet(path, _FUNDAMENTALS_COLS)
+    if df.empty:
+        return df
+    df["as_of"] = _to_utc(df["as_of"])
+    df = df[df["ticker"] == ticker]
+    if until is not None:
+        ts = pd.Timestamp(until)
+        cutoff = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        df = df[df["as_of"] <= cutoff].copy()
+        assert df["as_of"].max() <= cutoff if not df.empty else True, "Lookahead detected in load_fundamentals"
     return df.reset_index(drop=True)
 
 
