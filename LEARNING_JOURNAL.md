@@ -147,14 +147,14 @@ Every data point gets two timestamps: `date` (when it happened) and `fetched_at`
 
 I download OHLCV (Open, High, Low, Close, Volume) data for each ETF using `yfinance`. I adjust automatically for stock splits and dividends so historical comparisons are accurate. Data is saved in Parquet format, which is a columnar compressed format that is much faster to read than CSV for time-series data.
 
-## Phases 7 and 8: Not Yet Built
+## Phases 7, 8, 9: Status
 
-Phases 4, 5, and 6 are done (see the entries at the bottom of this journal). What's left:
+Phases 4, 5, and 6 are done. Phase 7 is done (see the entry near the bottom of this journal). What's left:
 
 | Phase | What | Key concepts I will encounter |
 |---|---|---|
-| **7** | Critic ↔ allocator revision loop | Agents looping on each other's output, escalation |
 | **8** | Streamlit dashboard | Data visualization, glide path charts, scenario tables |
+| **9** | Supervisor + crisis agent + dynamic routing | Conditional graph edges, planning vs. routing |
 
 ## Key Python Patterns I Am Using
 
@@ -280,3 +280,19 @@ Network calls fail sometimes. This decorator automatically retries with longer w
 **Financial concepts:** None new this phase — it's purely an architecture shift (agents pulling data instead of receiving it) built on Phase 4's reasoning and Phase 5's engine.
 
 **How it connects:** An offline test stubs the Groq client with a two-round script (round 1 calls `fetch_fred_series`, round 2 answers) and confirms the tool actually ran. A live `python main.py` run confirmed the same thing end-to-end, with sensibly lower confidence than the static path since the agent gathered less data.
+
+---
+
+## [Phase 7] — Critic ↔ allocator loop as a LangGraph cycle — 2026-07-08
+
+**Files changed:** `agents/graph/__init__.py`, `agents/graph/state.py`, `agents/graph/nodes.py`, `agents/graph/build.py`, `agents/allocator_agent.py`, `main.py`, `requirements.txt`, `tests/test_graph.py`, `tests/test_agents.py`
+
+**What I built:** A LangGraph `StateGraph` with an allocator node and a critic node. A conditional edge after the critic loops back to the allocator (feeding it the critic's serious findings) until the allocation passes `check_rules` or a `max_iterations` counter in the shared state runs out. `main.py`'s agent stage now builds an initial state and calls `build_graph().invoke(...)` instead of calling the allocator and critic directly.
+
+**Why this way:** LangGraph lets me express "loop until the critic is satisfied" as a graph edge instead of a hand-written `while` loop. The core idea is a **shared state** object (here, a `TypedDict` called `AdvisorState`) that every node reads from and writes to — instead of passing return values manually between function calls, each node returns a partial update and LangGraph merges it in. A **node** is just a plain function `(state) -> dict`; the allocator node and critic node are thin wrappers that call the *exact same* `allocator_agent.run()` / `critic_agent.run()` I already had, so the agents stay independently testable outside the graph too. A **conditional edge** (`add_conditional_edges`) is a routing function that inspects state and returns which node name to go to next — that's how "loop back if serious, else stop" becomes a declared edge (`_after_critic`) instead of buried control flow. I capped iterations in the *state itself* (an `int` the allocator node increments) rather than trusting the LLM to know when to stop — two LLMs critiquing each other can disagree forever, so a hard ceiling plus "return best-so-far" is the safe default. The allocator still only ever proposes bounded tilts (nothing about `apply_tilts` or `MAX_TILT` changed), so looping can't accidentally open a door for the LLM to invent a percentage.
+
+**Technical patterns:** `StateGraph(AdvisorState)` + `add_node`/`add_edge`/`add_conditional_edges` + `compile()` gives a runnable graph via `.invoke(initial_state)`. Nodes return partial dicts, not the full state — LangGraph does the merge, which is why `critic_node` can just return `{"critic_report": ..., "history": ..., "feedback": ...}` without re-stating `profile`, `macro`, etc. I also hit a real circular-import trap: `critic_agent.py` imports `AllocationProposal` from `allocator_agent.py`, so having `allocator_agent.py` import `CriticReport` back for a type hint would cycle. Fixed with `TYPE_CHECKING` — the import only happens for static type-checkers, never at runtime, since `from __future__ import annotations` already makes the annotation lazy.
+
+**Financial concepts:** Concentration risk — the acceptance criterion asks for an "80% QQQ tilt" to trigger a revision, but that exact scenario can't happen through the real allocator (QQQ isn't in the tiltable ticker set, and tilts clamp at ±10%), which is itself proof the anti-invention mechanism works. So I proved the loop two ways: a *realistic* one (an aggressive all-equity baseline pushed to 80% VTI by a legal-but-too-large tilt, breaching the 75% single-position cap) and a *literal* one (a hand-built proposal with `{"QQQ": 0.8, "BND": 0.2}`, bypassing the allocator to test the critic-loop machinery directly against the spec's exact example). Both converge back toward the diversified baseline, not toward a different concentrated bet — the fix for concentration risk is always "come back toward the anchor."
+
+**How it connects:** Replaces `main.py`'s single allocator-then-critic pass with a loop; `run_agent_stage` now returns the final `AdvisorState` (previously returned nothing) so Phase 8's dashboard can render the whole revision history without recomputing anything. A live `python main.py` run against the real Groq API converged in a single iteration with a clean critic pass, confirming the graph wiring works end-to-end, not just against mocks. The same graph gets a supervisor and crisis route bolted on in Phase 9 — `build.py` was written short enough on purpose that the Phase 9 diff should be almost entirely additions.

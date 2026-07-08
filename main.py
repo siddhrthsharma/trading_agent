@@ -76,23 +76,24 @@ def run_advisor() -> None:
     run_agent_stage(profile, allocation)
 
 
-def run_agent_stage(profile, baseline_allocation) -> None:
-    """Macro → valuation → allocator → critic (Phase 4 sequence; Phase 6 tool use).
+def run_agent_stage(profile, baseline_allocation):
+    """Macro → valuation → allocator ↔ critic (Phase 7: allocator/critic run as a LangGraph loop).
 
-    Macro and valuation agents now pull their own data via tools when
-    GROQ_API_KEY is set (Phase 6's `run(profile)`); if data is thin or the
-    tool-driven read fails, this falls back to the Phase-4 snapshot-based
-    `run_static(...)` path. Skips the whole stage (logging a warning) only if
-    there's no API key at all — the core Phase-1 pipeline above already
-    produced a usable result without any LLM calls.
+    Macro and valuation agents pull their own data via tools when GROQ_API_KEY is
+    set (Phase 6's `run(profile)`); if data is thin or the tool-driven read fails,
+    this falls back to the Phase-4 snapshot-based `run_static(...)` path. Skips the
+    whole stage (logging a warning) only if there's no API key at all — the core
+    Phase-1 pipeline above already produced a usable result without any LLM calls.
+
+    Returns the final AdvisorState (see agents/graph/state.py) or None if skipped.
     """
     from utils.config import get_settings
 
     if not get_settings().groq_api_key:
         logger.warning("GROQ_API_KEY not set — skipping agent stage (core allocation above still stands).")
-        return
+        return None
 
-    from agents import allocator_agent, critic_agent, macro_agent, valuation_agent
+    from agents import macro_agent, valuation_agent
 
     try:
         macro = macro_agent.run(profile)
@@ -108,7 +109,7 @@ def run_agent_stage(profile, baseline_allocation) -> None:
                 "Macro data not available locally either — skipping agent stage. "
                 "Run `python data/fetch_macro.py` first."
             )
-            return
+            return None
 
     try:
         valuation = valuation_agent.run(profile)
@@ -124,12 +125,20 @@ def run_agent_stage(profile, baseline_allocation) -> None:
                 "Fundamentals data not available locally either — skipping agent stage. "
                 "Run `python data/fetch_fundamentals.py` first."
             )
-            return
+            return None
+
+    from agents.graph.build import build_graph
+    from agents.graph.state import initial_state
 
     optimizer_hint = _try_optimizer_hint()
-    proposal = allocator_agent.run(profile, macro, valuation, optimizer_hint)
+    state = initial_state(profile, baseline_allocation, macro, valuation, optimizer_hint)
+    final_state = build_graph().invoke(state)
+
+    proposal = final_state["proposal"]
+    critic = final_state["critic_report"]
+
     logger.info("=" * 60)
-    logger.info("Baseline vs. tilted proposal:")
+    logger.info("Baseline vs. tilted proposal (after %d revision iteration(s)):", final_state["iteration"])
     all_tickers = sorted(set(proposal.baseline) | set(proposal.allocation), key=lambda t: -proposal.allocation.get(t, 0))
     for ticker in all_tickers:
         base_w = proposal.baseline.get(ticker, 0.0)
@@ -137,7 +146,6 @@ def run_agent_stage(profile, baseline_allocation) -> None:
         logger.info("  %-6s  baseline %5.1f%%  →  proposal %5.1f%%", ticker, base_w * 100, prop_w * 100)
     logger.info("Rationale: %s", proposal.rationale)
 
-    critic = critic_agent.run(proposal, macro, valuation, profile)
     logger.info("=" * 60)
     logger.info("Critic: passed=%s severity=%s", critic.passed, critic.severity)
     for v in critic.violations:
@@ -146,6 +154,17 @@ def run_agent_stage(profile, baseline_allocation) -> None:
         logger.info("  - %s", issue)
     logger.info("Critic reasoning: %s", critic.reasoning)
     logger.info("=" * 60)
+
+    if len(final_state["history"]) > 1:
+        logger.info("Revision history:")
+        for entry in final_state["history"]:
+            logger.info(
+                "  iter %d: passed=%s severity=%s tilts=%s",
+                entry["iteration"], entry["passed"], entry["severity"], entry["tilts"],
+            )
+        logger.info("=" * 60)
+
+    return final_state
 
 
 def _try_optimizer_hint():

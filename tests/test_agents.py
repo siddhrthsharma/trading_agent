@@ -335,6 +335,36 @@ def test_allocator_agent_none_optimizer_hint_is_default():
     assert inspect.signature(allocator_agent.run).parameters["optimizer_hint"].default is None
 
 
+def test_allocator_agent_none_feedback_is_default():
+    from agents import allocator_agent
+    import inspect
+
+    assert inspect.signature(allocator_agent.run).parameters["feedback"].default is None
+
+
+def test_allocator_agent_folds_feedback_into_prompt():
+    """Phase 7: revision-loop feedback (critic's violations/issues) must reach the prompt."""
+    from agents import allocator_agent, critic_agent
+    from engine.allocation import RuleViolation
+
+    feedback = critic_agent.CriticReport(
+        passed=False,
+        violations=[RuleViolation(rule="concentration", severity="serious", detail="VTI at 80.0% exceeds 75% limit")],
+        qualitative_issues=["Tilt not well justified by the stated macro read"],
+        severity="serious",
+        confidence=0.6,
+        reasoning="Too concentrated.",
+    )
+    fake_response = {"tilts": {}, "rationale": "reverted", "confidence": 0.7}
+    with patch("agents.allocator_agent.call_llm_json", return_value=fake_response) as mock_call:
+        allocator_agent.run(_profile(), _macro_assessment(), _valuation_assessment(), feedback=feedback)
+
+    prompt = mock_call.call_args.args[0]
+    assert "concentration" in prompt
+    assert "VTI at 80.0% exceeds 75% limit" in prompt
+    assert "Tilt not well justified" in prompt
+
+
 # ---------------------------------------------------------------------------
 # critic_agent
 # ---------------------------------------------------------------------------

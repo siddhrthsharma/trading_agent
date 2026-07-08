@@ -6,6 +6,7 @@ allocation weights are always produced by engine.allocation.apply_tilts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -16,6 +17,9 @@ from engine.allocation import MAX_TILT, apply_tilts
 from engine.optimizer import OptimizationResult
 from profile.investor_profile import InvestorProfile
 from utils.llm import call_llm_json
+
+if TYPE_CHECKING:
+    from agents.critic_agent import CriticReport
 
 _REQUIRED_KEYS = ["tilts", "rationale", "confidence"]
 
@@ -70,6 +74,21 @@ def _generate(prompt: str) -> dict:
     return data
 
 
+def _build_feedback_section(feedback: "CriticReport | None") -> str:
+    if feedback is None:
+        return ""
+    violation_lines = "\n".join(f"  [{v.severity}] {v.rule}: {v.detail}" for v in feedback.violations) or "  (none)"
+    issue_lines = "\n".join(f"  - {issue}" for issue in feedback.qualitative_issues) or "  (none)"
+    return f"""
+Your previous proposal was rejected by a critic for the issues below. Revise your
+tilts to resolve them -- moving back toward the baseline is usually the right fix.
+Rule violations:
+{violation_lines}
+Qualitative issues:
+{issue_lines}
+"""
+
+
 def _build_prompt(
     profile: InvestorProfile,
     baseline: dict[str, float],
@@ -77,8 +96,10 @@ def _build_prompt(
     valuation: ValuationAssessment,
     allowed_tickers: set[str],
     optimizer_hint: OptimizationResult | None,
+    feedback: "CriticReport | None" = None,
 ) -> str:
     baseline_lines = "\n".join(f"  {t}: {w:.1%}" for t, w in sorted(baseline.items(), key=lambda x: -x[1]))
+    feedback_section = _build_feedback_section(feedback)
 
     optimizer_section = ""
     if optimizer_hint is not None:
@@ -93,7 +114,7 @@ estimation error makes this fragile, do not treat it as a target):
     return f"""\
 Baseline allocation (already computed by core/portfolios.py — this is the anchor):
 {baseline_lines}
-{optimizer_section}
+{optimizer_section}{feedback_section}
 Macro regime read (confidence {macro.confidence:.0%}): {macro.regime}
   Recession signal: {macro.recession_signal:.2f} | suggested route: {macro.suggested_route}
   Reasoning: {macro.reasoning}
@@ -121,16 +142,19 @@ def run(
     macro: MacroAssessment,
     valuation: ValuationAssessment,
     optimizer_hint: OptimizationResult | None = None,
+    feedback: "CriticReport | None" = None,
 ) -> AllocationProposal:
     """Propose bounded tilts on top of the core/ baseline; Python applies and clamps them.
 
     `optimizer_hint` (Phase 5+) is an unconstrained mean-variance read shown as
     additional context only — it never changes the baseline anchor or tilt bounds.
+    `feedback` (Phase 7+) is the prior critic report, if this is a revision within
+    the critic <-> allocator loop; it is folded into the prompt as constraints.
     """
     baseline = default_for(profile)
     allowed_tickers = set(baseline) | {"BIL"}
 
-    prompt = _build_prompt(profile, baseline, macro, valuation, allowed_tickers, optimizer_hint)
+    prompt = _build_prompt(profile, baseline, macro, valuation, allowed_tickers, optimizer_hint, feedback)
     data = _generate(prompt)
 
     raw_tilts = {t: float(v) for t, v in data["tilts"].items() if t in allowed_tickers}
