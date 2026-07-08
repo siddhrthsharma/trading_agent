@@ -34,13 +34,19 @@ class AdvisorState(TypedDict, total=False):
 def initial_state(
     profile: InvestorProfile,
     baseline: dict[str, float],
-    macro: MacroAssessment | None,
-    valuation: ValuationAssessment | None,
-    optimizer_hint: OptimizationResult | None,
+    macro: MacroAssessment | None = None,
+    valuation: ValuationAssessment | None = None,
+    optimizer_hint: OptimizationResult | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     goal: str = "Allocate long-term investments for this profile",
 ) -> AdvisorState:
-    """Build the graph's entry state from pre-computed pipeline inputs."""
+    """Build the graph's entry state from pre-computed pipeline inputs.
+
+    `macro`/`valuation` may be omitted (Phase 9): the macro/valuation nodes
+    fill them in as the graph runs. Phase-7-style callers that already have
+    both computed can still pass them positionally to skip those nodes'
+    real work in tests.
+    """
     return AdvisorState(
         profile=profile,
         goal=goal,

@@ -72,12 +72,17 @@ def _severity_of(violations: list[RuleViolation]) -> str:
 def _build_prompt(
     proposal: AllocationProposal,
     macro: MacroAssessment,
-    valuation: ValuationAssessment,
+    valuation: ValuationAssessment | None,
     profile: InvestorProfile,
     violations: list[RuleViolation],
 ) -> str:
     alloc_lines = "\n".join(f"  {t}: {w:.1%}" for t, w in sorted(proposal.allocation.items(), key=lambda x: -x[1]))
     violation_lines = "\n".join(f"  [{v.severity}] {v.rule}: {v.detail}" for v in violations) or "  (none)"
+    valuation_line = (
+        f"Valuation read: cheap={valuation.cheap}, rich={valuation.rich} (confidence {valuation.confidence:.0%})"
+        if valuation is not None
+        else "Valuation read: (skipped on the crisis path — capital preservation takes priority)"
+    )
     return f"""\
 Proposed allocation:
 {alloc_lines}
@@ -90,7 +95,7 @@ Deterministic rule check results (already computed — do not re-derive):
 {violation_lines}
 
 Macro regime: {macro.regime} (confidence {macro.confidence:.0%}, route {macro.suggested_route})
-Valuation read: cheap={valuation.cheap}, rich={valuation.rich} (confidence {valuation.confidence:.0%})
+{valuation_line}
 Investor: {profile.horizon_years}-year horizon, {profile.risk_tolerance} risk tolerance,
 constraints: {profile.constraints or "none"}.
 
@@ -106,10 +111,14 @@ Return a JSON object with exactly these keys:
 def run(
     proposal: AllocationProposal,
     macro: MacroAssessment,
-    valuation: ValuationAssessment,
+    valuation: ValuationAssessment | None,
     profile: InvestorProfile,
 ) -> CriticReport:
-    """Run deterministic rule checks, then layer qualitative LLM critique on top."""
+    """Run deterministic rule checks, then layer qualitative LLM critique on top.
+
+    `valuation` is None on the crisis path (Phase 9), which skips the valuation
+    agent entirely — capital preservation doesn't depend on cheap/rich reads.
+    """
     violations = check_rules(proposal.allocation)
     severity = _severity_of(violations)
 

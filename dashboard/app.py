@@ -155,6 +155,18 @@ def render_agent_stage(profile, baseline: dict[str, float]):
     valuation = final_state["valuation"]
     proposal = final_state["proposal"]
     critic = final_state["critic_report"]
+    plan = final_state.get("plan")
+
+    route = final_state["route"]
+    if route == "crisis":
+        st.warning(f"**Route: crisis** — defensive specialist engaged (recession signal {macro.recession_signal:.2f}).")
+    else:
+        st.info(f"**Route: normal** (recession signal {macro.recession_signal:.2f}).")
+    if plan is not None:
+        with st.expander(f"Supervisor plan (confidence {plan.confidence:.0%})"):
+            for step in plan.steps:
+                st.markdown(f"- {step}")
+            st.caption(plan.rationale)
 
     st.subheader("Macro & Valuation Reads")
     cols = st.columns(2)
@@ -162,8 +174,11 @@ def render_agent_stage(profile, baseline: dict[str, float]):
         st.markdown(f"**Regime:** {macro.regime} (confidence {macro.confidence:.0%}, route={macro.suggested_route})")
         st.caption(macro.reasoning)
     with cols[1]:
-        st.markdown(f"**Cheap:** {valuation.cheap} · **Rich:** {valuation.rich} (confidence {valuation.confidence:.0%})")
-        st.caption(valuation.reasoning)
+        if valuation is not None:
+            st.markdown(f"**Cheap:** {valuation.cheap} · **Rich:** {valuation.rich} (confidence {valuation.confidence:.0%})")
+            st.caption(valuation.reasoning)
+        else:
+            st.caption("Valuation read skipped on the crisis path — capital preservation takes priority.")
 
     st.subheader("Final Critic Report")
     if critic.passed:

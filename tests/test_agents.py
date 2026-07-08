@@ -417,3 +417,90 @@ def test_critic_agent_rejects_non_list_issues():
     with patch("agents.critic_agent.call_llm_json", return_value=bad_response):
         with pytest.raises(ValueError):
             critic_agent.run(proposal, _macro_assessment(), _valuation_assessment(), _profile())
+
+
+def test_critic_agent_accepts_none_valuation_on_crisis_path():
+    """Phase 9: the crisis path skips the valuation agent entirely; critic must still run."""
+    from agents.allocator_agent import AllocationProposal
+    from agents import critic_agent
+
+    profile = _profile()
+    proposal = AllocationProposal(
+        allocation={"VTI": 0.45, "VXUS": 0.20, "BND": 0.35}, baseline={"VTI": 0.45, "VXUS": 0.20, "BND": 0.35},
+        tilts={}, rationale="defensive: none needed", confidence=0.7,
+    )
+    fake_response = {"qualitative_issues": [], "confidence": 0.7, "reasoning": "Looks fine."}
+    with patch("agents.critic_agent.call_llm_json", return_value=fake_response) as mock_call:
+        report = critic_agent.run(proposal, _macro_assessment(suggested_route="crisis"), None, profile)
+
+    assert report.passed is True
+    prompt = mock_call.call_args.args[0]
+    assert "skipped on the crisis path" in prompt
+
+
+# ---------------------------------------------------------------------------
+# crisis_agent
+# ---------------------------------------------------------------------------
+
+def test_crisis_agent_applies_tilts_via_engine():
+    """Same anti-invention mechanism as the allocator: the LLM never outputs a percentage."""
+    from agents import crisis_agent
+    from core.portfolios import default_for
+    from engine.allocation import apply_tilts
+
+    profile = _profile()
+    baseline = default_for(profile)
+
+    fake_response = {
+        "tilts": {"BND": 0.05, "VTI": -0.05},
+        "rationale": "Elevated recession signal argues for a defensive tilt.",
+        "confidence": 0.6,
+    }
+    with patch("agents.crisis_agent.call_llm_json", return_value=fake_response):
+        proposal = crisis_agent.run(profile, _macro_assessment(recession_signal=0.9, suggested_route="crisis"))
+
+    expected = apply_tilts(baseline, {"BND": 0.05, "VTI": -0.05})
+    assert proposal.allocation == expected
+    assert proposal.baseline == baseline
+
+
+def test_crisis_agent_clamps_absurd_tilt():
+    from agents import crisis_agent
+    from engine.allocation import MAX_TILT
+
+    fake_response = {"tilts": {"BND": 5.0}, "rationale": "test", "confidence": 0.9}
+    with patch("agents.crisis_agent.call_llm_json", return_value=fake_response):
+        proposal = crisis_agent.run(_profile(), _macro_assessment(recession_signal=0.9, suggested_route="crisis"))
+
+    assert sum(proposal.allocation.values()) == pytest.approx(1.0)
+    assert proposal.tilts["BND"] == pytest.approx(MAX_TILT)
+
+
+def test_crisis_agent_drops_disallowed_tickers():
+    from agents import crisis_agent
+
+    fake_response = {"tilts": {"GLD": 0.05}, "rationale": "test", "confidence": 0.5}
+    with patch("agents.crisis_agent.call_llm_json", return_value=fake_response):
+        proposal = crisis_agent.run(_profile(), _macro_assessment(recession_signal=0.9, suggested_route="crisis"))
+
+    assert "GLD" not in proposal.allocation
+    assert proposal.allocation == proposal.baseline
+
+
+def test_crisis_agent_valuation_defaults_to_none():
+    from agents import crisis_agent
+    import inspect
+
+    assert inspect.signature(crisis_agent.run).parameters["valuation"].default is None
+
+
+def test_crisis_agent_works_without_valuation():
+    from agents import crisis_agent
+
+    fake_response = {"tilts": {}, "rationale": "no tilt warranted", "confidence": 0.8}
+    with patch("agents.crisis_agent.call_llm_json", return_value=fake_response) as mock_call:
+        proposal = crisis_agent.run(_profile(), _macro_assessment(recession_signal=0.9, suggested_route="crisis"))
+
+    assert proposal.allocation == proposal.baseline
+    prompt = mock_call.call_args.args[0]
+    assert "Valuation read" not in prompt

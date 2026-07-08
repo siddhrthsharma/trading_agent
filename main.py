@@ -76,14 +76,16 @@ def run_advisor() -> None:
     run_agent_stage(profile, allocation)
 
 
-def run_agent_stage(profile, baseline_allocation):
-    """Macro → valuation → allocator ↔ critic (Phase 7: allocator/critic run as a LangGraph loop).
+def run_agent_stage(profile, baseline_allocation, goal: str = "Allocate long-term investments for this profile"):
+    """Supervisor → macro → (crisis | valuation → allocator) → critic, as a LangGraph (Phase 9).
 
-    Macro and valuation agents pull their own data via tools when GROQ_API_KEY is
-    set (Phase 6's `run(profile)`); if data is thin or the tool-driven read fails,
-    this falls back to the Phase-4 snapshot-based `run_static(...)` path. Skips the
-    whole stage (logging a warning) only if there's no API key at all — the core
-    Phase-1 pipeline above already produced a usable result without any LLM calls.
+    The macro node pulls its own data via tools when GROQ_API_KEY is set (falling
+    back to the Phase-4 snapshot-based path if that fails), then routes to the
+    defensive crisis specialist when the recession signal is high, or the normal
+    valuation → allocator path otherwise. Both branches loop through the critic
+    until it passes or `max_iterations` is hit. Skips the whole stage (logging a
+    warning) if there's no API key, or if neither the tool-driven nor
+    snapshot-based macro/valuation read is available.
 
     Returns the final AdvisorState (see agents/graph/state.py) or None if skipped.
     """
@@ -93,52 +95,27 @@ def run_agent_stage(profile, baseline_allocation):
         logger.warning("GROQ_API_KEY not set — skipping agent stage (core allocation above still stands).")
         return None
 
-    from agents import macro_agent, valuation_agent
-
-    try:
-        macro = macro_agent.run(profile)
-        logger.info("Macro regime (tool-driven): %s (confidence %.0f%%, route=%s)", macro.regime, macro.confidence * 100, macro.suggested_route)
-    except Exception:
-        logger.warning("Tool-driven macro read failed — falling back to the snapshot-based path.")
-        from data.snapshots import macro_snapshot
-        try:
-            macro = macro_agent.run_static(macro_snapshot(), profile)
-            logger.info("Macro regime (static): %s (confidence %.0f%%, route=%s)", macro.regime, macro.confidence * 100, macro.suggested_route)
-        except ValueError:
-            logger.warning(
-                "Macro data not available locally either — skipping agent stage. "
-                "Run `python data/fetch_macro.py` first."
-            )
-            return None
-
-    try:
-        valuation = valuation_agent.run(profile)
-        logger.info("Valuation read (tool-driven): cheap=%s rich=%s (confidence %.0f%%)", valuation.cheap, valuation.rich, valuation.confidence * 100)
-    except Exception:
-        logger.warning("Tool-driven valuation read failed — falling back to the snapshot-based path.")
-        from data.snapshots import valuation_snapshot
-        try:
-            valuation = valuation_agent.run_static(valuation_snapshot(), profile)
-            logger.info("Valuation read (static): cheap=%s rich=%s (confidence %.0f%%)", valuation.cheap, valuation.rich, valuation.confidence * 100)
-        except ValueError:
-            logger.warning(
-                "Fundamentals data not available locally either — skipping agent stage. "
-                "Run `python data/fetch_fundamentals.py` first."
-            )
-            return None
-
     from agents.graph.build import build_graph
+    from agents.graph.nodes import AgentDataUnavailable
     from agents.graph.state import initial_state
 
     optimizer_hint = _try_optimizer_hint()
-    state = initial_state(profile, baseline_allocation, macro, valuation, optimizer_hint)
-    final_state = build_graph().invoke(state)
+    state = initial_state(profile, baseline_allocation, optimizer_hint=optimizer_hint, goal=goal)
+
+    try:
+        final_state = build_graph().invoke(state)
+    except AgentDataUnavailable as exc:
+        logger.warning(str(exc))
+        return None
 
     proposal = final_state["proposal"]
     critic = final_state["critic_report"]
 
     logger.info("=" * 60)
-    logger.info("Baseline vs. tilted proposal (after %d revision iteration(s)):", final_state["iteration"])
+    logger.info("Route: %s | Revision iterations: %d", final_state["route"], final_state["iteration"])
+    if final_state.get("plan") is not None:
+        logger.info("Supervisor plan: %s", final_state["plan"].steps)
+    logger.info("Baseline vs. tilted proposal:")
     all_tickers = sorted(set(proposal.baseline) | set(proposal.allocation), key=lambda t: -proposal.allocation.get(t, 0))
     for ticker in all_tickers:
         base_w = proposal.baseline.get(ticker, 0.0)
