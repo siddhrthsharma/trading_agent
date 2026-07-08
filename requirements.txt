@@ -49,3 +49,4 @@ groq
 scipy==1.18.0
 PyPortfolioOpt==1.6.0
 langgraph==1.2.8
+streamlit==1.59.1

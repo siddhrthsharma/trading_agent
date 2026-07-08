@@ -153,8 +153,9 @@ Phases 4, 5, and 6 are done. Phase 7 is done (see the entry near the bottom of t
 
 | Phase | What | Key concepts I will encounter |
 |---|---|---|
-| **8** | Streamlit dashboard | Data visualization, glide path charts, scenario tables |
 | **9** | Supervisor + crisis agent + dynamic routing | Conditional graph edges, planning vs. routing |
+
+Phase 8 is done too (see the entry below).
 
 ## Key Python Patterns I Am Using
 
@@ -296,3 +297,19 @@ Network calls fail sometimes. This decorator automatically retries with longer w
 **Financial concepts:** Concentration risk — the acceptance criterion asks for an "80% QQQ tilt" to trigger a revision, but that exact scenario can't happen through the real allocator (QQQ isn't in the tiltable ticker set, and tilts clamp at ±10%), which is itself proof the anti-invention mechanism works. So I proved the loop two ways: a *realistic* one (an aggressive all-equity baseline pushed to 80% VTI by a legal-but-too-large tilt, breaching the 75% single-position cap) and a *literal* one (a hand-built proposal with `{"QQQ": 0.8, "BND": 0.2}`, bypassing the allocator to test the critic-loop machinery directly against the spec's exact example). Both converge back toward the diversified baseline, not toward a different concentrated bet — the fix for concentration risk is always "come back toward the anchor."
 
 **How it connects:** Replaces `main.py`'s single allocator-then-critic pass with a loop; `run_agent_stage` now returns the final `AdvisorState` (previously returned nothing) so Phase 8's dashboard can render the whole revision history without recomputing anything. A live `python main.py` run against the real Groq API converged in a single iteration with a clean critic pass, confirming the graph wiring works end-to-end, not just against mocks. The same graph gets a supervisor and crisis route bolted on in Phase 9 — `build.py` was written short enough on purpose that the Phase 9 diff should be almost entirely additions.
+
+---
+
+## [Phase 8] — Streamlit dashboard — 2026-07-08
+
+**Files changed:** `dashboard/app.py`, `requirements.txt`
+
+**What I built:** A one-file Streamlit dashboard (`streamlit run dashboard/app.py`) with seven sections: profile + emergency-fund gate, the agent stage (critic notes and the Phase 7 revision history, behind a "Run agents" button so the LLM only gets called when I ask), default vs. proposed allocation, the glide path, the DCA growth projection, the multi-regime backtest suite vs. baselines, and a final baseline comparison table.
+
+**Why this way:** The dashboard is explicitly a *view*, not a second implementation. Every number on the page comes from calling an existing function — `core.portfolios.default_for`, `core.contributions.project_growth`, `core.accounts.emergency_fund_status`, `backtest.engine.run_regime_suite`, or (for anything LLM-driven) `main.run_agent_stage`, which is the same Phase-7 code path `python main.py` uses. If I'd reimplemented any of that logic in `dashboard/app.py` instead of calling it, the dashboard and the CLI could quietly drift apart and show two different "truths." I put the agent stage behind a button rather than running it automatically on page load: Streamlit reruns the *entire script* top-to-bottom on every interaction, so without a button an LLM call (with real cost and latency) would fire on every single widget click anywhere on the page, not just the ones related to the agent stage.
+
+**Technical patterns:** `@st.cache_data` memoizes pure, deterministic calls (the profile load, the glide-path table, the backtest suite) so Streamlit's rerun-on-every-interaction model doesn't redo expensive work like the multi-regime backtest on every click. `st.session_state` is different — it's a dict that survives across reruns *within one browser session*, which is what lets the "Run agents" button's result stick around after the page reruns for an unrelated reason (I use it, not `@st.cache_data`, for the agent stage because a `dataclass`-based `AdvisorState` isn't a hashable cache key and because I *want* a fresh graph run each time I click the button, not a cached one). To verify the dashboard actually renders without a browser, I used Streamlit's own `streamlit.testing.v1.AppTest`, which executes the script headlessly and lets me assert on `at.exception`, `at.header`, `at.info`, etc. — much more reliable than `curl`ing the page, since Streamlit's real UI is a single-page app that only appears after a websocket connects.
+
+**Financial concepts:** None new — Phase 8 is presentation, not new financial logic. The one thing worth internalizing from *looking* at the rendered backtest table: the honest baselines (three-fund, 60/40, target-date, all-equity) are the yardstick, and if the LLM-tilted proposal doesn't clearly beat them after costs in a given regime, the dashboard shows that plainly instead of hiding it — that's the "the honest baseline is sacred" rule made visible, not just enforced in code.
+
+**How it connects:** Reuses `agents/graph/build.py` and `main.run_agent_stage` from Phase 7 with zero duplication — the dashboard is proof that the graph's final state (`AdvisorState`) is a genuinely useful, self-contained object for a caller other than `main.py`. Verified twice with `AppTest`: once with a real `GROQ_API_KEY` (all 7 sections render, backtest suite runs against real local price history with the VXUS→EFA 2008 proxy substitution logging correctly), and once with `.env` temporarily removed (confirmed restored afterward) to prove the "GROQ_API_KEY not set" info message and graceful skip actually fire when the key is genuinely absent, not just unset in the shell — `utils.config.get_settings()` is `lru_cache`d and `load_dotenv()`s from the `.env` file directly, so a shell-only `unset` doesn't fully simulate a missing key.
